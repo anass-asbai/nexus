@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Create/load private credentials and optionally finish the existing Nexus workflow."""
 import argparse
+from contextlib import contextmanager
 import getpass
 import os
 from pathlib import Path
@@ -18,6 +19,21 @@ from nexus_api import Client, NexusError, base_url
 DESTINATION = Path('/tmp/nexus-migration-credentials.env')
 ROOT = Path(__file__).resolve().parents[2]
 PREFIXES = ('NEXUS_ADMIN', 'NEXUS_READ', 'NEXUS_PUBLISH')
+DEFAULT_USERNAMES = ('admin', 'buy02-reader', 'buy02-publisher')
+
+
+@contextmanager
+def private_environment(values):
+    previous = {key: os.environ.get(key) for key in values}
+    try:
+        os.environ.update(values)
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def hidden(label, default=''):
@@ -56,16 +72,8 @@ def repair_service_passwords(path, values):
         raise NexusError('Password repair requires your local interactive terminal.')
     if path.resolve().is_relative_to(ROOT):
         raise NexusError('Credential file must be outside the checkout.')
-    previous = {key: os.environ.get(key) for key in values}
-    try:
-        os.environ.update(values)
+    with private_environment(values):
         users = Client().json('GET', '/security/users')
-    finally:
-        for key, value in previous.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
     existing = {u['userId'] for u in users if u.get('source', 'default') == 'default'}
     updates = {}
     for prefix in ('NEXUS_READ', 'NEXUS_PUBLISH'):
@@ -165,7 +173,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--file', type=Path, default=DESTINATION)
     parser.add_argument('--url', help='Endpoint override in memory; new files default to http://127.0.0.1:8081')
-    parser.add_argument('--bootstrap', action='store_true', help='Fresh local container only: read generated admin password privately and replace it with your prompted password')
+    parser.add_argument('--bootstrap', action='store_true', help='Fresh local container only: read and replace its initial admin password privately')
+    parser.add_argument('--generate', action='store_true', help='Generate service credentials. With --bootstrap, generate the admin password too; otherwise use the current admin password')
     parser.add_argument('--container', default='buy02-nexus')
     parser.add_argument('--reuse', action='store_true', help='Load existing mode-0600 file without replacing it')
     parser.add_argument('--repair-service-passwords', action='store_true', help='Privately repair only short passwords for new reader/publisher accounts; requires --reuse')
@@ -174,6 +183,8 @@ def main():
     try:
         if args.reuse and args.bootstrap:
             raise NexusError('--bootstrap cannot be combined with --reuse.')
+        if args.generate and args.reuse:
+            raise NexusError('--generate cannot be combined with --reuse.')
         if args.repair_service_passwords and not args.reuse:
             raise NexusError('--repair-service-passwords requires --reuse.')
         if args.reuse:
@@ -185,23 +196,40 @@ def main():
         else:
             if args.file.exists() or args.file.is_symlink():
                 raise NexusError('Credential file exists; refusing overwrite. Use --reuse to load it.')
-            if not sys.stdin.isatty() or not sys.stderr.isatty():
+            if not args.generate and (not sys.stdin.isatty() or not sys.stderr.isatty()):
                 raise NexusError('Run from your local interactive terminal; private prompts require a TTY.')
             path = args.file.expanduser().resolve()
             if path.is_relative_to(ROOT):
                 raise NexusError('Choose a credential path outside the checkout.')
-            print('Use the current admin password. Rotate any exposed password in Nexus first.')
             values = {'NEXUS_URL': base_url(args.url or 'http://127.0.0.1:8081')}
-            for prefix, default in zip(PREFIXES, ('admin', 'buy02-reader', 'buy02-publisher')):
-                username = hidden(prefix + ' username (hidden; Enter for default): ', default)
-                if not re.fullmatch(r'[A-Za-z0-9_.-]+', username):
-                    raise NexusError('Invalid account name.')
-                values[prefix + '_USERNAME'] = username
-                generated = '' if prefix == 'NEXUS_ADMIN' else secrets.token_urlsafe(32)
-                label = (' admin password (hidden): ' if prefix == 'NEXUS_ADMIN' else ' password (hidden; Enter generates only for a NEW account): ')
-                values[prefix + '_PASSWORD'] = hidden(prefix + label, generated)
-                if prefix != 'NEXUS_ADMIN':
-                    values[prefix + '_EMAIL'] = hidden(prefix + ' email (hidden): ')
+            if args.generate:
+                for prefix, username in zip(PREFIXES, DEFAULT_USERNAMES):
+                    values[prefix + '_USERNAME'] = username
+                    values[prefix + '_PASSWORD'] = secrets.token_urlsafe(32)
+                    if prefix != 'NEXUS_ADMIN':
+                        values[prefix + '_EMAIL'] = username + '@example.invalid'
+                if not args.bootstrap:
+                    password = os.environ.get('NEXUS_ADMIN_PASSWORD', '')
+                    if not password and (not sys.stdin.isatty() or not sys.stderr.isatty()):
+                        raise NexusError('Set NEXUS_ADMIN_PASSWORD in your private environment or run in a terminal for a hidden prompt.')
+                    values['NEXUS_ADMIN_PASSWORD'] = password or hidden('Current Nexus admin password: ')
+                    with private_environment(values):
+                        users = Client().json('GET', '/security/users')
+                    existing = {user['userId'] for user in users if user.get('source', 'default') == 'default'}
+                    if existing.intersection(DEFAULT_USERNAMES[1:]):
+                        raise NexusError('A default Maven service account already exists. Use the interactive helper to supply existing credentials or choose new account names.')
+            else:
+                print('Choose a new admin password.' if args.bootstrap else 'Use the current admin password. Rotate any exposed password in Nexus first.')
+                for prefix, default in zip(PREFIXES, DEFAULT_USERNAMES):
+                    username = hidden(prefix + ' username (hidden; Enter for default): ', default)
+                    if not re.fullmatch(r'[A-Za-z0-9_.-]+', username):
+                        raise NexusError('Invalid account name.')
+                    values[prefix + '_USERNAME'] = username
+                    generated = '' if prefix == 'NEXUS_ADMIN' else secrets.token_urlsafe(32)
+                    label = (' admin password (hidden): ' if prefix == 'NEXUS_ADMIN' else ' password (hidden; Enter generates only for a NEW account): ')
+                    values[prefix + '_PASSWORD'] = hidden(prefix + label, generated)
+                    if prefix != 'NEXUS_ADMIN':
+                        values[prefix + '_EMAIL'] = hidden(prefix + ' email (hidden): ')
             ids = [values[p + '_USERNAME'] for p in PREFIXES]
             if len(set(ids)) != 3 or 'anonymous' in ids:
                 raise NexusError('Admin, reader and publisher must be distinct accounts.')
@@ -210,16 +238,8 @@ def main():
                     raise NexusError('Bootstrap requires the local admin account and localhost endpoint.')
                 initial = subprocess.run(['docker', 'exec', args.container, 'cat', '/nexus-data/admin.password'], capture_output=True, text=True, check=False)
                 if initial.returncode or not initial.stdout.strip():
-                    raise NexusError('Fresh bootstrap password unavailable; use normal interactive setup for an existing instance.')
-                previous = {k: os.environ.get(k) for k in ('NEXUS_URL', 'NEXUS_ADMIN_USERNAME', 'NEXUS_ADMIN_PASSWORD')}
-                try:
-                    os.environ.update(NEXUS_URL=values['NEXUS_URL'], NEXUS_ADMIN_USERNAME='admin', NEXUS_ADMIN_PASSWORD=initial.stdout.strip())
-                    with Client().open('PUT', '/service/rest/v1/security/users/admin/change-password', values['NEXUS_ADMIN_PASSWORD'].encode(), 'text/plain'):
-                        pass
-                finally:
-                    for key, value in previous.items():
-                        if value is None: os.environ.pop(key, None)
-                        else: os.environ[key] = value
+                    raise NexusError(f'Initial Nexus password unavailable in {args.container}. If Nexus is already initialized, rerun with --generate and omit --bootstrap.')
+            # Save the new password before changing Nexus so it survives an interrupted response.
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
             with os.fdopen(fd, 'w', encoding='utf-8') as stream:
                 os.fchmod(stream.fileno(), 0o600)
@@ -227,7 +247,14 @@ def main():
                     stream.write(f'{key}={shlex.quote(value)}\n')
                 stream.flush()
                 os.fsync(stream.fileno())
-            print('Saved private mode-0600 file; no values displayed. Existing account passwords are never reset.')
+            if args.bootstrap:
+                try:
+                    with private_environment(dict(NEXUS_URL=values['NEXUS_URL'], NEXUS_ADMIN_USERNAME='admin', NEXUS_ADMIN_PASSWORD=initial.stdout.strip())):
+                        with Client().open('PUT', '/service/rest/v1/security/users/admin/change-password', values['NEXUS_ADMIN_PASSWORD'].encode(), 'text/plain'):
+                            pass
+                except NexusError as exc:
+                    raise NexusError(f'{exc} The candidate credentials were saved. Check which admin password works before moving or replacing the file.') from exc
+            print('Saved private mode-0600 credential file.')
         if args.finish:
             finish(values)
         return 0

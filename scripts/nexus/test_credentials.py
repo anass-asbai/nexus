@@ -78,6 +78,47 @@ class CredentialTests(unittest.TestCase):
             prompt.assert_not_called()
             self.assertEqual(path.read_text(), 'existing-private-content')
 
+    def test_generate_bootstraps_without_a_terminal_or_prompts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'private.env'
+            with patch('sys.argv', ['setup', '--bootstrap', '--generate', '--file', str(path)]), \
+                 patch('sys.stdin.isatty', return_value=False), \
+                 patch('setup_credentials.hidden') as prompt, \
+                 patch('setup_credentials.subprocess.run', return_value=SimpleNamespace(returncode=0, stdout='initial-secret')), \
+                 patch('setup_credentials.Client') as client, contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(setup_credentials.main(), 0)
+            prompt.assert_not_called()
+            values = load_private(path)
+            self.assertEqual(tuple(values[p + '_USERNAME'] for p in setup_credentials.PREFIXES),
+                             ('admin', 'buy02-reader', 'buy02-publisher'))
+            passwords = {values[p + '_PASSWORD'] for p in setup_credentials.PREFIXES}
+            self.assertEqual(len(passwords), 3)
+            for password in passwords | {'initial-secret'}:
+                self.assertNotIn(password, output.getvalue())
+            self.assertEqual(client.return_value.open.call_args.args[2], values['NEXUS_ADMIN_PASSWORD'].encode())
+
+    def test_generate_on_existing_instance_uses_current_admin_and_checks_account_names(self):
+        for users in ([], [{'userId': 'buy02-reader'}]):
+            with self.subTest(users=users), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / 'private.env'
+                with patch('sys.argv', ['setup', '--generate', '--file', str(path)]), \
+                     patch.dict(os.environ, {'NEXUS_ADMIN_PASSWORD': 'current-admin-secret'}), \
+                     patch('setup_credentials.hidden') as prompt, \
+                     patch('setup_credentials.subprocess.run') as run, \
+                     patch('setup_credentials.Client') as client, \
+                     contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    client.return_value.json.return_value = users
+                    self.assertEqual(setup_credentials.main(), 1 if users else 0)
+                prompt.assert_not_called()
+                run.assert_not_called()
+                client.return_value.json.assert_called_once_with('GET', '/security/users')
+                if users:
+                    self.assertFalse(path.exists())
+                else:
+                    values = load_private(path)
+                    self.assertEqual(values['NEXUS_ADMIN_PASSWORD'], 'current-admin-secret')
+                    self.assertNotEqual(values['NEXUS_READ_PASSWORD'], values['NEXUS_PUBLISH_PASSWORD'])
+
     def repair_fixture(self, directory, reader='short', publisher='valid-publisher-password'):
         path = Path(directory) / 'private.env'
         values = {'NEXUS_URL': 'http://127.0.0.1:18081'}

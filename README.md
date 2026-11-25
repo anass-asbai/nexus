@@ -447,22 +447,56 @@ docker compose -p nexus -f nexus/docker-compose.yml exec -T nexus id
 
 Nexus should be writable and run as the non-root user with UID `200`. The
 `buy02-nexus-data` volume retains repositories and artifacts between restarts.
-Open [Nexus](http://127.0.0.1:8081). For a fresh instance, follow the first-login
-steps, accept the license agreement and disable anonymous access.
+For a fresh instance, use the automated credential setup in step 2 before
+signing in. If you prefer to set up Nexus manually, read the initial password
+from the container.
+
+```bash
+docker compose -p nexus -f nexus/docker-compose.yml exec -T nexus cat /nexus-data/admin.password
+```
+
+Open [Nexus](http://127.0.0.1:8081) and sign in as `admin` with the password
+printed by the command. Follow the setup wizard to choose a new password, accept
+the license agreement and disable anonymous access. Use the new password for
+subsequent sign-ins.
 See the [Maven runbook](docs/NEXUS_MAVEN_RUNBOOK.md#fresh-clone-onboarding-for-teammates).
 
 ### 2. Set up Maven repositories
 
-After first login, run the credential helper once. Enter the administrator
-credentials and choose separate reader and publisher credentials. If the private
-file already exists, skip the helper and load the existing file.
+Once a fresh Nexus instance is healthy, run the helper before first login. It
+uses `admin`, `buy02-reader` and `buy02-publisher` and generates a separate
+password for each account without prompting. It reads the initial Nexus password
+privately, changes it and saves the new credentials to a file with mode `0600`.
 
 ```bash
 python3 scripts/nexus/setup_credentials.py \
-  --url http://127.0.0.1:8081 --file /tmp/buy02-nexus-team.env
+  --bootstrap --generate --url http://127.0.0.1:8081 --file /tmp/buy02-nexus-team.env
+```
+
+If the credential file already exists for this instance, load it below. If
+Nexus is already initialized and you still need the file, omit `--bootstrap`.
+The helper uses `NEXUS_ADMIN_PASSWORD` if it is set or prompts privately for your
+current admin password. It generates both Maven service passwords automatically.
+If a default Maven service account already exists, use the interactive helper
+without `--generate` to supply its existing credentials or choose a new account.
+
+```bash
+python3 scripts/nexus/setup_credentials.py \
+  --generate --url http://127.0.0.1:8081 --file /tmp/buy02-nexus-team.env
+```
+
+```bash
 set -a
 source /tmp/buy02-nexus-team.env
 set +a
+```
+
+On a fresh instance, display the generated admin password with
+`printf '%s\n' "$NEXUS_ADMIN_PASSWORD"`, sign in as `admin` at
+[Nexus](http://127.0.0.1:8081), accept the license agreement and disable anonymous
+access. Then preview the Maven configuration.
+
+```bash
 python3 scripts/nexus/manage.py provision
 ```
 
